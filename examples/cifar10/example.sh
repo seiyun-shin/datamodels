@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -e
-tmp_dir=/tmp/$RANDOM
+tmp_dir=log_dir
 mkdir $tmp_dir
 echo "Job dir: ${tmp_dir}"
 
