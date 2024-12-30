@@ -1,0 +1,3 @@
+data:
+  train_dataset: /tmp/datasets/cifar_ffcv/cifar_train.beton
+  val_dataset: /tmp/datasets/cifar_ffcv/cifar_val.beton
