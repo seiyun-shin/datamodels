@@ -5,7 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 import torch as ch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn import CrossEntropyLoss
 from torch.optim import SGD, lr_scheduler
 import torchvision
@@ -137,13 +137,13 @@ def train(model, loaders, lr=None, epochs=None, label_smoothing=None,
                             [0, lr_peak_epoch * iters_per_epoch, epochs * iters_per_epoch],
                             [0, 1, 0])
     scheduler = lr_scheduler.LambdaLR(opt, lr_schedule.__getitem__)
-    scaler = GradScaler()
+    scaler = GradScaler("cuda")
     loss_fn = CrossEntropyLoss(label_smoothing=label_smoothing)
 
     for _ in range(epochs):
         for ims, labs in tqdm(loaders['train']):
             opt.zero_grad(set_to_none=True)
-            with autocast():
+            with autocast(device_type="cuda"):
                 out = model(ims)
                 loss = loss_fn(out, labs)
 
@@ -158,7 +158,7 @@ def evaluate(model, loaders, lr_tta=False):
     with ch.no_grad():
         all_margins = []
         for ims, labs in tqdm(loaders['test']):
-            with autocast():
+            with autocast(device_type="cuda"):
                 out = model(ims)
                 if lr_tta:
                     out += model(ch.fliplr(ims))
