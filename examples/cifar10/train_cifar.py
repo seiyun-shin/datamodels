@@ -119,7 +119,7 @@ def construct_model():
         ch.nn.Linear(128, num_class, bias=False),
         Mul(0.2)
     )
-    model = model.to(memory_format=ch.channels_last).cuda()
+    model = model.to(memory_format=torch.channels_last).to(torch.device('cuda:0'))
     return model
 
 @param('training.lr')
