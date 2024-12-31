@@ -1,5 +1,5 @@
 data:
-    data_path: 'OUT_DIR/data.beton' # Path to FFCV dataset
+    data_path: 'log_dir/data.beton' # Path to FFCV dataset
     num_train: 90 # Number of models to use for training
     num_val: 10 # Number of models to use for validation
     seed: 0 # Random seed for picking validation set
@@ -12,7 +12,7 @@ cfg:
     batch_size: 10 # Batch size for regression, must divide num_train and num_val
     lr: 1e-4 # Learning rate
     eps: 1e-2 # Multiplicative difference between the highest and lowest lambda
-    out_dir: OUT_DIR # Where to save the results
+    out_dir: log_dir # Where to save the results
     num_workers: 8 # Number of workers for dataloader
 early_stopping:
     check_every: 3 # How often to check for inner and outer-loop convergence
