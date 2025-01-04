@@ -101,7 +101,7 @@ def construct_model(model_type="resnet"):
         ).cuda()
         return model
     elif model_type == "sparse_vit":
-        # Custom ViT model with modifications (e.g., different pretrained weights)
+        # Compressed sensing based ViT model with modifications (e.g., different pretrained weights)
         model = ViTForImageClassification.from_pretrained(
             "facebook/dino-vit-base", num_labels=10
         ).cuda()
@@ -270,9 +270,9 @@ def main():
         }
         print(f"ViT Average Margin: {results['vit']['average_margin']}")
 
-    # Train and evaluate Custom ViT
+    # Train and evaluate Compressed sensing based ViT
     if config.model in ['sparse_vit', 'all']:
-        print("\nTraining Custom ViT...")
+        print("\nTraining Compressed sensing based ViT...")
         sparse_vit_model = construct_model(model_type='sparse_vit')
         train(sparse_vit_model, loaders)
         sparse_vit_margins = evaluate(sparse_vit_model, loaders)
@@ -280,18 +280,18 @@ def main():
             'margins': sparse_vit_margins,
             'average_margin': sparse_vit_margins.mean()
         }
-        print(f"Custom ViT Average Margin: {results['sparse_vit']['average_margin']}")
+        print(f"Compressed sensing based ViT Average Margin: {results['sparse_vit']['average_margin']}")
 
     # Print comparison results
     if config.model == 'all':
         print("\nModel Comparison Results:")
         print(f"ResNet Average Margin: {results['resnet']['average_margin']}")
         print(f"ViT Average Margin: {results['vit']['average_margin']}")
-        print(f"Custom ViT Average Margin: {results['sparse_vit']['average_margin']}")
+        print(f"Compressed sensing based ViT Average Margin: {results['sparse_vit']['average_margin']}")
         print("Margin Differences:")
         print(f"  ViT - ResNet: {results['vit']['average_margin'] - results['resnet']['average_margin']}")
-        print(f"  Custom ViT - ResNet: {results['sparse_vit']['average_margin'] - results['resnet']['average_margin']}")
-        print(f"  Custom ViT - ViT: {results['sparse_vit']['average_margin'] - results['vit']['average_margin']}")
+        print(f"  Compressed sensing based ViT - ResNet: {results['sparse_vit']['average_margin'] - results['resnet']['average_margin']}")
+        print(f"  Compressed sensing based ViT - ViT: {results['sparse_vit']['average_margin'] - results['vit']['average_margin']}")
 
     # Save masks and margins
     print("\nSaving results...")
