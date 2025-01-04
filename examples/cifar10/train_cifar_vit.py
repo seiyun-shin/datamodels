@@ -140,22 +140,81 @@ def evaluate(model, loaders, lr_tta=False):
         print('Average margin:', all_margins.mean())
         return all_margins.numpy()
 
-def main(index, logdir):
+# def main(index, logdir):
+#     config = get_current_config()
+#     parser = argparse.ArgumentParser(description='Fast CIFAR-10 training')
+#     parser.add_argument("--model", type=str, choices=['resnet', 'vit'], default='resnet', help="Model type: resnet or vit")
+#     config.augment_argparse(parser)
+#     config.collect_argparse_args(parser)
+#     config.validate(mode='stderr')
+#     config.summary()
+
+#     mask = (np.random.rand(50_000) > 0.5)
+#     loaders = make_dataloaders(mask=np.nonzero(mask)[0])
+#     model = construct_model(model_type=config.model)
+#     train(model, loaders)
+#     res = evaluate(model, loaders)
+#     print(mask.shape, res.shape)
+#     return {
+#         'masks': mask,
+#         'margins': res
+#     }
+def main():
     config = get_current_config()
-    parser = argparse.ArgumentParser(description='Fast CIFAR-10 training')
-    parser.add_argument("--model", type=str, choices=['resnet', 'vit'], default='resnet', help="Model type: resnet or vit")
+    parser = argparse.ArgumentParser(description='Fast CIFAR-10 training and comparison')
+    parser.add_argument("--model", type=str, choices=['resnet', 'vit', 'both'], default='both',
+                        help="Model type to train and evaluate: resnet, vit, or both")
     config.augment_argparse(parser)
     config.collect_argparse_args(parser)
     config.validate(mode='stderr')
     config.summary()
 
+    # Randomly mask 50% of the training data for subset-based evaluation
     mask = (np.random.rand(50_000) > 0.5)
     loaders = make_dataloaders(mask=np.nonzero(mask)[0])
-    model = construct_model(model_type=config.model)
-    train(model, loaders)
-    res = evaluate(model, loaders)
-    print(mask.shape, res.shape)
+
+    results = {}
+
+    # Train and evaluate ResNet
+    if config.model in ['resnet', 'both']:
+        print("\nTraining ResNet...")
+        resnet_model = construct_model(model_type='resnet')
+        train(resnet_model, loaders)
+        resnet_margins = evaluate(resnet_model, loaders)
+        results['resnet'] = {
+            'margins': resnet_margins,
+            'average_margin': resnet_margins.mean()
+        }
+        print(f"ResNet Average Margin: {results['resnet']['average_margin']}")
+
+    # Train and evaluate ViT
+    if config.model in ['vit', 'both']:
+        print("\nTraining ViT...")
+        vit_model = construct_model(model_type='vit')
+        train(vit_model, loaders)
+        vit_margins = evaluate(vit_model, loaders)
+        results['vit'] = {
+            'margins': vit_margins,
+            'average_margin': vit_margins.mean()
+        }
+        print(f"ViT Average Margin: {results['vit']['average_margin']}")
+
+    # Print comparison results
+    if config.model == 'both':
+        print("\nModel Comparison Results:")
+        print(f"ResNet Average Margin: {results['resnet']['average_margin']}")
+        print(f"ViT Average Margin: {results['vit']['average_margin']}")
+        print("Margin Difference (ViT - ResNet):",
+              results['vit']['average_margin'] - results['resnet']['average_margin'])
+
+    # Save masks and margins
+    print("\nSaving results...")
+    np.savez(f"{config.logdir}/comparison_results.npz", masks=mask, resnet_margins=results.get('resnet', {}).get('margins'),
+             vit_margins=results.get('vit', {}).get('margins'))
+    print("Results saved successfully!")
+
+    # Return results for further usage
     return {
         'masks': mask,
-        'margins': res
+        'results': results
     }
