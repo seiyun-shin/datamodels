@@ -17,6 +17,7 @@ from fast_l1 import regressor
 from dataclasses import replace
 
 
+# Define operation for slicing tensors
 class Slice(Operation):
     def __init__(self, start_ind, end_ind) -> None:
         super().__init__()
@@ -35,24 +36,21 @@ class Slice(Operation):
         return make_slice
 
     def declare_state_and_memory(self, previous_state):
-        end_ind = previous_state.shape[0] if self.end_ind == -1 \
-                  else self.end_ind
+        end_ind = previous_state.shape[0] if self.end_ind == -1 else self.end_ind
         new_shape = (int(end_ind) - self.start_ind,)
         return replace(previous_state, shape=new_shape), None
 
 
+# Define sections for parameter configurations
 Section('data', 'source data info').params(
     data_path=Param(str, 'Path to beton file', required=True),
     num_train=Param(int, 'Number of models for training', required=True),
     num_val=Param(int, 'Number of models for validation', required=True),
-    seed=Param(int, 'Random seed for picking validation set'),
-    target_start_ind=Param(int, 'Start of target slice', default=0),
-    target_end_ind=Param(int, 'End of target slice', default=-1)
+    sparsity=Param(int, 'Sparsity level for compressed sensing matrix', default=10),
 )
 
 Section('cfg', 'arguments to give the writer').params(
-    k=Param(int, 'Number of lambdas on the regularization path',
-            required=True),
+    k=Param(int, 'Number of lambdas on the regularization path', required=True),
     lr=Param(float, 'Learning rate to use', default=0.01),
     eps=Param(float, '(min lambda) / (max lambda)', default=1e-5),
     batch_size=Param(int, 'Batch size for regression', required=True),
@@ -61,175 +59,96 @@ Section('cfg', 'arguments to give the writer').params(
     use_bias=Param(int, 'Whether to use the bias parameter', default=1)
 )
 
-Section('early_stopping', 'arguments specific to early stopping').params(
-    check_every=Param(int, 'How often to check for improvement', default=2),
-    eps=Param(float, 'Improvement required at every check', default=1e-5)
-)
+
+# Generate loaders for train, validation, and test datasets
+@param('data.data_path')
+@param('data.num_train')
+@param('data.num_val')
+def make_loaders(data_path=None, num_train=None, num_val=None):
+    train_loader = make_loader(np.arange(num_train), data_path)
+    val_loader = make_loader(np.arange(num_train, num_train + num_val), data_path)
+    return train_loader, val_loader
 
 
 @param('data.data_path')
-@param('data.target_start_ind')
-@param('data.target_end_ind')
 @param('cfg.num_workers')
 @param('cfg.batch_size')
-def make_loader(subset, data_path=None, num_workers=None,
-                target_start_ind=None, target_end_ind=None,
-                drop_last=True, batch_size: int = 0) -> Loader:
-    assert len(subset) % batch_size == 0, \
-        f'Batch size ({batch_size}) should divide dataset size ({len(subset)})'
-    return Loader(data_path,
-                  batch_size=batch_size,
-                  num_workers=num_workers,
-                  order=OrderOption.RANDOM,
-                  indices=subset,
-                  drop_last=drop_last,
-                  os_cache=True,
-                  pipelines={
-                      'mask': [NDArrayDecoder(),
-                               ToTensor(),
-                               ToDevice(ch.device('cuda:0'))],
-                      'targets': [NDArrayDecoder(),
-                                  ToTensor(),
-                                  Slice(target_start_ind, target_end_ind),
-                                  ToDevice(ch.device('cuda:0'))],
-                      'idx': [IntDecoder(),
-                              ToTensor(),
-                              Squeeze(),
-                              ToDevice(ch.device('cuda:0'))]
-                  }, recompile=False)
-
-
-@param('data.num_train')
-@param('data.num_val')
-def make_loaders(num_train: int = -1, num_val: int = -1):
-    return make_loader(subset=np.arange(num_train)), \
-           make_loader(subset=np.arange(num_train, num_train + num_val)), \
-           make_loader(subset=np.arange(num_train + num_val))
-
-
-@section('cfg')
-@param('lr')
-@param('k')
-@param('eps')
-@param('out_dir')
-@param('use_bias')
-@section('early_stopping')
-@param('check_every', alias='early_stop_freq')
-@param('eps', alias='early_stop_eps')
-@section('data')
-@param('target_start_ind')
-@param('target_end_ind')
-def main(lr: float, k: int, eps: float,
-         out_dir: str,
-         use_bias: int,
-         early_stop_freq: int,
-         early_stop_eps: float,
-         target_start_ind: int,
-         target_end_ind: int):
-    train_loader, val_loader, full_loader = make_loaders()
-    max_lam = regressor.calc_max_lambda(train_loader)
-
-    n_features = train_loader.reader.handlers['mask'].shape[0]
-    n_targets = train_loader.reader.handlers['targets'].shape[0]
-    if target_end_ind == -1:
-        n_targets -= target_start_ind
-    else:
-        n_targets = target_end_ind - target_start_ind
-
-    n_targets = int(n_targets)
-    print(n_features, n_targets)
-
-    weight = ch.zeros(n_features, n_targets).cuda()
-    bias = ch.zeros(n_targets).cuda()
-
-    assert not os.path.exists(out_dir)
-    log_path = Path(out_dir) / 'regularization_path/'
-    final_log_path = Path(out_dir) / 'final_lambda/'
-    os.makedirs(log_path)
-    os.makedirs(final_log_path)
-    best_lam = \
-        regressor.train_saga(weight,
-                             bias,
-                             train_loader,
-                             val_loader,
-                             lr=lr,
-                             start_lams=max_lam,
-                             update_bias=(use_bias > 0),
-                             lam_decay=np.exp(np.log(eps)/k),
-                             num_lambdas=k,
-                             early_stop_freq=early_stop_freq,
-                             early_stop_eps=early_stop_eps,
-                             logdir=str(log_path))
-
-    ch.cuda.empty_cache()
-    regressor.train_saga(weight,
-                         bias,
-                         full_loader,
-                         None,
-                         lr=lr,
-                         start_lams=best_lam,
-                         update_bias=(use_bias > 0),
-                         lam_decay=1.,
-                         num_lambdas=1,
-                         early_stop_freq=early_stop_freq,
-                         early_stop_eps=early_stop_eps,
-                         logdir=str(final_log_path))
-    ch.save({
-        'weight': weight.cpu(),
-        'bias':  bias.cpu(),
-        'lam': best_lam.cpu()
-    }, Path(out_dir) / 'datamodels.pt')
-
-# Function to construct sparse sign matrix
-def sample_sparse_sign_matrix(m, n, s):
-    """
-    Generate a sparse sign matrix S of shape (m, n) with sparsity s.
-    """
-    S = np.random.choice(
-        [1, 0, -1],
-        size=(m, n),
-        p=[1 / (2 * s), 1 - 1 / s, 1 / (2 * s)]
+def make_loader(indices, data_path=None, num_workers=None, batch_size=None):
+    return Loader(
+        data_path,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        order=OrderOption.RANDOM,
+        indices=indices,
+        os_cache=True,
+        pipelines={
+            'mask': [NDArrayDecoder(), ToTensor(), ToDevice(ch.device('cuda:0'))],
+            'targets': [NDArrayDecoder(), ToTensor(), ToDevice(ch.device('cuda:0'))],
+            'idx': [IntDecoder(), ToTensor(), Squeeze(), ToDevice(ch.device('cuda:0'))]
+        },
+        recompile=False
     )
+
+
+# Construct sparse sign matrix
+def sample_sparse_sign_matrix(m, n, sparsity):
+    S = np.random.choice([1, 0, -1], size=(m, n), p=[1 / (2 * sparsity), 1 - 1 / sparsity, 1 / (2 * sparsity)])
     return ch.tensor(S, dtype=ch.float32).cuda()
 
+
+# Construct design matrix A
 def construct_design_matrix(m, n, sparsity):
-    """
-    Construct the design matrix A using the sparse sign matrix S.
-    """
     S = sample_sparse_sign_matrix(m, n, sparsity)
     A = np.sqrt(sparsity / n) * S
     return A
 
-Section('cfg', 'arguments for datamodels').params(
-    sparsity=Param(int, 'Sparsity level for compressed sensing matrix', default=10)
-)
 
-@section('cfg')
-@param('sparsity')
-def main(sparsity, *args, **kwargs):
-    config = get_current_config()
-    train_loader, val_loader, full_loader = make_loaders()
-    
-    # Generate compressed sensing matrix
+# Main function
+@param('data.data_path')
+@param('data.num_train')
+@param('data.num_val')
+@param('data.sparsity')
+@param('cfg.k')
+@param('cfg.lr')
+@param('cfg.eps')
+@param('cfg.out_dir')
+def main(data_path, num_train, num_val, sparsity, k, lr, eps, out_dir):
+    train_loader, val_loader = make_loaders(data_path, num_train, num_val)
+
+    # Initialize model parameters
     n_features = train_loader.reader.handlers['mask'].shape[0]
-    m = config.data.num_train
-    A = construct_design_matrix(m, n_features, sparsity)
+    weight = ch.zeros(n_features, 1).cuda()
+    bias = ch.zeros(1).cuda()
 
-    # Replace the design matrix in the workflow
-    weight = ch.zeros(n_features, config.data.num_val).cuda()
-    bias = ch.zeros(config.data.num_val).cuda()
+    # Calculate maximum lambda
     max_lam = regressor.calc_max_lambda(train_loader)
 
-    log_path = Path(config.cfg.out_dir) / 'logs'
-    os.makedirs(log_path, exist_ok=True)
+    # Generate compressed sensing matrix
+    A = construct_design_matrix(num_train, n_features, sparsity)
 
-    regressor.train_saga(weight, bias, train_loader, val_loader,
-                         lr=config.cfg.lr, start_lams=max_lam,
-                         logdir=str(log_path))
+    # Prepare logging directory
+    logdir = Path(out_dir) / "logs/compressed_sensing/"
+    os.makedirs(logdir, exist_ok=True)
 
-if __name__ == '__main__':
+    # Train model using compressed sensing
+    regressor.train_saga_with_cs(
+        weight,
+        bias,
+        train_loader,
+        val_loader,
+        A=A,
+        lr=lr,
+        start_lams=max_lam,
+        num_lambdas=k,
+        lam_decay=np.exp(np.log(eps) / k),
+        logdir=str(logdir)
+    )
+    print("Training completed.")
+
+
+if __name__ == "__main__":
     config = get_current_config()
-    parser = ArgumentParser(description='Datamodel regression')
+    parser = ArgumentParser(description="Datamodel regression with compressed sensing")
     config.augment_argparse(parser)
     config.collect_argparse_args(parser)
     config.validate(mode='stderr')
