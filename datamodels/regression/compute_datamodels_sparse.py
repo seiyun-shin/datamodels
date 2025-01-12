@@ -47,6 +47,7 @@ Section('data', 'source data info').params(
     num_train=Param(int, 'Number of models for training', required=True),
     num_val=Param(int, 'Number of models for validation', required=True),
     sparsity=Param(int, 'Sparsity level for compressed sensing matrix', default=10),
+    num_classes=Param(int, 'Number of classes for multi-class classification', required=True),
 )
 
 Section('cfg', 'arguments to give the writer').params(
@@ -89,7 +90,6 @@ def make_loader(indices, data_path=None, num_workers=None, batch_size=None):
         recompile=False
     )
 
-
 # Construct sparse sign matrix
 def sample_sparse_sign_matrix(m, n, sparsity):
     S = np.random.choice([1, 0, -1], size=(m, n), p=[1 / (2 * sparsity), 1 - 1 / sparsity, 1 / (2 * sparsity)])
@@ -107,18 +107,19 @@ def construct_design_matrix(m, n, sparsity):
 @param('data.data_path')
 @param('data.num_train')
 @param('data.num_val')
+@param('data.num_classes')
 @param('data.sparsity')
 @param('cfg.k')
 @param('cfg.lr')
 @param('cfg.eps')
 @param('cfg.out_dir')
-def main(data_path, num_train, num_val, sparsity, k, lr, eps, out_dir):
+def main(data_path, num_train, num_val, num_classes, sparsity, k, lr, eps, out_dir):
     train_loader, val_loader = make_loaders(data_path, num_train, num_val)
 
     # Initialize model parameters
     n_features = train_loader.reader.handlers['mask'].shape[0]
-    weight = ch.zeros(n_features, 1).cuda()
-    bias = ch.zeros(1).cuda()
+    weight = ch.zeros(n_features, num_classes).cuda()  # One weight vector per class
+    bias = ch.zeros(num_classes).cuda()  # One bias per class
 
     # Calculate maximum lambda
     max_lam = regressor.calc_max_lambda(train_loader)
@@ -148,7 +149,7 @@ def main(data_path, num_train, num_val, sparsity, k, lr, eps, out_dir):
 
 if __name__ == "__main__":
     config = get_current_config()
-    parser = ArgumentParser(description="Datamodel regression with compressed sensing")
+    parser = ArgumentParser(description="Datamodel regression with compressed sensing for multi-class classification")
     config.augment_argparse(parser)
     config.collect_argparse_args(parser)
     config.validate(mode='stderr')
