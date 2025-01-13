@@ -22,18 +22,24 @@ from ffcv.transforms import RandomHorizontalFlip, Cutout, \
 from ffcv.transforms.common import Squeeze
 
 
-# Custom ResizeWrapper for ffcv pipeline
-from torchvision.transforms import Resize
+from ffcv.pipeline.operation import Operation
+import numpy as np
+from PIL import Image
 
 class ResizeWrapper(Operation):
     def __init__(self, size):
-        self.resize = Resize(size)
+        super().__init__()
+        self.size = size
 
     def generate_code(self):
-        def resize_function(images, *args):
-            return self.resize(images)
-        return resize_function
-
+        def resize(images, *args):
+            resized_images = np.zeros((images.shape[0], self.size[1], self.size[0], images.shape[3]), dtype=images.dtype)
+            for i in range(images.shape[0]):
+                img = Image.fromarray(images[i])
+                img = img.resize(self.size, Image.BICUBIC)
+                resized_images[i] = np.array(img)
+            return resized_images
+        return resize
 
 # Construct sparse sign matrix
 def sample_sparse_sign_matrix(m, n, sparsity):
@@ -74,6 +80,7 @@ Section('data', 'data related stuff').params(
 
 from ffcv.transforms import SimpleRGBImageDecoder, ToDevice, ToTorchImage
 from ffcv.transforms.common import Squeeze
+from ffcv.transforms import ToTorchImage
 
 @param('data.train_dataset')
 @param('data.val_dataset')
@@ -106,20 +113,12 @@ def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_
                 RandomHorizontalFlip(),
                 RandomTranslate(padding=2, fill=tuple(map(int, CIFAR_MEAN))),
                 Cutout(4, tuple(map(int, CIFAR_MEAN))),
-                ToTorchImage(),
-                torchvision.transforms.Resize((224, 224)),  # Resize for ViT
+                ResizeWrapper((224, 224)),  # Add Resize transformation using ResizeWrapper
             ])
         else:
             image_pipeline.extend([
-                torchvision.transforms.Resize((224, 224)),  # Resize test images
-                ToTorchImage(),
+                ResizeWrapper((224, 224)),  # Resize for test data as well
             ])
-
-        image_pipeline.extend([
-            ToDevice(ch.device("cuda:0"), non_blocking=True),
-            Convert(ch.float16),
-            torchvision.transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
-        ])
 
         ordering = OrderOption.RANDOM if name == 'train' else OrderOption.SEQUENTIAL
 
