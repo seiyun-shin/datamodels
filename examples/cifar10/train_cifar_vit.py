@@ -18,14 +18,12 @@ from ffcv.fields.decoders import IntDecoder, SimpleRGBImageDecoder
 from ffcv.loader import Loader, OrderOption
 from ffcv.pipeline.operation import Operation
 from ffcv.transforms import RandomHorizontalFlip, Cutout, \
-    RandomTranslate, Convert, ToDevice, ToTensor, ToTorchImage
+    RandomTranslate, Convert, ToDevice, ToTensor
 from ffcv.transforms.common import Squeeze
 
-
-from ffcv.pipeline.operation import Operation
-import numpy as np
 from PIL import Image
 
+# ResizeWrapper for custom resizing
 class ResizeWrapper(Operation):
     def __init__(self, size):
         super().__init__()
@@ -43,22 +41,14 @@ class ResizeWrapper(Operation):
 
 # Construct sparse sign matrix
 def sample_sparse_sign_matrix(m, n, sparsity):
-    """
-    Generate a sparse sign matrix S of shape (m, n) with sparsity.
-    """
     S = np.random.choice([1, 0, -1], size=(m, n), p=[1 / (2 * sparsity), 1 - 1 / sparsity, 1 / (2 * sparsity)])
     return ch.tensor(S, dtype=ch.float32).cuda()
 
-
 # Construct design matrix A
 def construct_design_matrix(m, n, sparsity):
-    """
-    Construct the design matrix using the sparse sign matrix.
-    """
     S = sample_sparse_sign_matrix(m, n, sparsity)
     A = np.sqrt(sparsity / n) * S
     return A
-
 
 Section('training', 'Hyperparameters').params(
     lr=Param(float, 'The learning rate to use', default=5e-5),
@@ -71,16 +61,9 @@ Section('training', 'Hyperparameters').params(
 )
 
 Section('data', 'data related stuff').params(
-    train_dataset=Param(str, '.dat file to use for training', 
-        default='/tmp/datasets/cifar_ffcv/cifar_train.beton'),
-    val_dataset=Param(str, '.dat file to use for validation', 
-        default='/tmp/datasets/cifar_ffcv/cifar_val.beton'),
+    train_dataset=Param(str, '.dat file to use for training', default='/tmp/datasets/cifar_ffcv/cifar_train.beton'),
+    val_dataset=Param(str, '.dat file to use for validation', default='/tmp/datasets/cifar_ffcv/cifar_val.beton'),
 )
-
-
-from ffcv.transforms import SimpleRGBImageDecoder, ToDevice, ToTorchImage
-from ffcv.transforms.common import Squeeze
-from ffcv.transforms import ToTorchImage
 
 @param('data.train_dataset')
 @param('data.val_dataset')
@@ -98,11 +81,11 @@ def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_
 
     # Generate sparse sign matrix for compressed sensing
     total_samples = 50_000  # CIFAR-10 training dataset size
-    sparsity = 100  # Number of "influential" samples in total
+    sparsity = 100
     num_rows = int(np.ceil((sparsity * np.log(2 * total_samples / sparsity) + np.log(100)) / (0.465 ** 2)))
 
     sparse_matrix = construct_design_matrix(num_rows, total_samples, sparsity)
-    mask = (sparse_matrix.sum(axis=1) > 0).to(dtype=ch.bool)  # Convert to boolean tensor
+    mask = (sparse_matrix.sum(axis=1) > 0).to(dtype=ch.bool)
 
     for name in ['train', 'test']:
         label_pipeline: List[Operation] = [IntDecoder(), ToTensor(), ToDevice(ch.device("cuda:0")), Squeeze()]
@@ -113,12 +96,19 @@ def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_
                 RandomHorizontalFlip(),
                 RandomTranslate(padding=2, fill=tuple(map(int, CIFAR_MEAN))),
                 Cutout(4, tuple(map(int, CIFAR_MEAN))),
-                ResizeWrapper((224, 224)),  # Add Resize transformation using ResizeWrapper
+                ResizeWrapper((224, 224)),
             ])
         else:
             image_pipeline.extend([
-                ResizeWrapper((224, 224)),  # Resize for test data as well
+                ResizeWrapper((224, 224)),
             ])
+
+        image_pipeline.extend([
+            ToTensor(),
+            ToDevice(ch.device("cuda:0"), non_blocking=True),
+            Convert(ch.float16),
+            torchvision.transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+        ])
 
         ordering = OrderOption.RANDOM if name == 'train' else OrderOption.SEQUENTIAL
 
@@ -130,24 +120,17 @@ def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_
     return loaders
 
 def construct_vit_model():
-    # Load pretrained ViT model
     model = ViTForImageClassification.from_pretrained(
         "google/vit-base-patch16-224-in21k",
-        num_labels=10  # CIFAR-10 has 10 classes
+        num_labels=10
     ).cuda()
-    
-    # Reinitialize the classifier head for CIFAR-10
     model.classifier = ch.nn.Linear(
-        in_features=model.config.hidden_size,  # Match hidden size from pretrained config
-        out_features=10  # CIFAR-10 has 10 classes
+        in_features=model.config.hidden_size,
+        out_features=10
     ).cuda()
-    
-    # Ensure new classifier weights are initialized
     ch.nn.init.xavier_uniform_(model.classifier.weight)
     ch.nn.init.zeros_(model.classifier.bias)
-    
     return model
-
 
 @param('training.lr')
 @param('training.epochs')
@@ -162,12 +145,11 @@ def train(model, loaders, lr=None, epochs=None, weight_decay=None):
         for ims, labs in tqdm(loaders['train']):
             opt.zero_grad()
             with autocast(device_type="cuda"):
-                out = model(ims).logits  # For ViT models
+                out = model(ims).logits
                 loss = loss_fn(out, labs)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
-
 
 @param('training.lr_tta')
 def evaluate(model, loaders, lr_tta=False):
@@ -176,7 +158,7 @@ def evaluate(model, loaders, lr_tta=False):
         all_margins = []
         for ims, labs in tqdm(loaders['test']):
             with autocast(device_type="cuda"):
-                out = model(ims).logits  # For ViT models
+                out = model(ims).logits
                 if lr_tta:
                     out += model(ch.fliplr(ims)).logits
                     out /= 2
@@ -188,6 +170,7 @@ def evaluate(model, loaders, lr_tta=False):
         all_margins = ch.cat(all_margins)
         print('Average margin:', all_margins.mean())
         return all_margins.numpy()
+
 
 
 def main(index, logdir):
