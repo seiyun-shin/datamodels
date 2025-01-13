@@ -72,6 +72,9 @@ Section('data', 'data related stuff').params(
 )
 
 
+from ffcv.transforms import SimpleRGBImageDecoder, ToDevice, ToTorchImage
+from ffcv.transforms.common import Squeeze
+
 @param('data.train_dataset')
 @param('data.val_dataset')
 @param('training.batch_size')
@@ -88,43 +91,44 @@ def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_
 
     # Generate sparse sign matrix for compressed sensing
     total_samples = 50_000  # CIFAR-10 training dataset size
-    sparsity = 100     # Number of "influential" samples in total   
+    sparsity = 100  # Number of "influential" samples in total
     num_rows = int(np.ceil((sparsity * np.log(2 * total_samples / sparsity) + np.log(100)) / (0.465 ** 2)))
 
     sparse_matrix = construct_design_matrix(num_rows, total_samples, sparsity)
-    mask = (sparse_matrix.sum(axis=1) > 0).to(dtype=ch.bool)   # Select rows with non-zero entries
+    mask = (sparse_matrix.sum(axis=1) > 0).to(dtype=ch.bool)  # Convert to boolean tensor
 
     for name in ['train', 'test']:
         label_pipeline: List[Operation] = [IntDecoder(), ToTensor(), ToDevice(ch.device("cuda:0")), Squeeze()]
         image_pipeline: List[Operation] = [SimpleRGBImageDecoder()]
+
         if name == 'train':
             image_pipeline.extend([
                 RandomHorizontalFlip(),
                 RandomTranslate(padding=2, fill=tuple(map(int, CIFAR_MEAN))),
                 Cutout(4, tuple(map(int, CIFAR_MEAN))),
-                ResizeWrapper((224, 224)),  # Use the custom wrapper for Resize
+                ToTorchImage(),
+                torchvision.transforms.Resize((224, 224)),  # Resize for ViT
             ])
         else:
             image_pipeline.extend([
-                ResizeWrapper((224, 224)),  # Resize for test data as well
+                torchvision.transforms.Resize((224, 224)),  # Resize test images
+                ToTorchImage(),
             ])
+
         image_pipeline.extend([
-            ToTensor(),
             ToDevice(ch.device("cuda:0"), non_blocking=True),
-            ToTorchImage(),
             Convert(ch.float16),
             torchvision.transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
         ])
-        
+
         ordering = OrderOption.RANDOM if name == 'train' else OrderOption.SEQUENTIAL
 
-        loaders[name] = Loader(paths[name], indices=(np.nonzero(mask)[0] if name == 'train' else None),
+        loaders[name] = Loader(paths[name], indices=(np.nonzero(mask.cpu().numpy())[0] if name == 'train' else None),
                                batch_size=batch_size, num_workers=num_workers,
                                order=ordering, drop_last=(name == 'train'),
                                pipelines={'image': image_pipeline, 'label': label_pipeline})
 
     return loaders
-
 
 def construct_vit_model():
     # Load pretrained ViT model
