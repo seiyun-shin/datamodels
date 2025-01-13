@@ -1,4 +1,5 @@
-import argparse
+from argparse import ArgumentParser
+from typing import List
 import time
 import numpy as np
 from tqdm import tqdm
@@ -7,9 +8,8 @@ import torch as ch
 from torch.amp import GradScaler, autocast
 from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
-import torchvision
-
 from transformers import ViTForImageClassification
+import torchvision
 
 from fastargs import get_current_config, Param, Section
 from fastargs.decorators import param
@@ -21,13 +21,47 @@ from ffcv.transforms import RandomHorizontalFlip, Cutout, \
     RandomTranslate, Convert, ToDevice, ToTensor, ToTorchImage
 from ffcv.transforms.common import Squeeze
 
+
+# Custom ResizeWrapper for ffcv pipeline
+from torchvision.transforms import Resize
+
+class ResizeWrapper(Operation):
+    def __init__(self, size):
+        self.resize = Resize(size)
+
+    def generate_code(self):
+        def resize_function(images, *args):
+            return self.resize(images)
+        return resize_function
+
+
+# Construct sparse sign matrix
+def sample_sparse_sign_matrix(m, n, sparsity):
+    """
+    Generate a sparse sign matrix S of shape (m, n) with sparsity.
+    """
+    S = np.random.choice([1, 0, -1], size=(m, n), p=[1 / (2 * sparsity), 1 - 1 / sparsity, 1 / (2 * sparsity)])
+    return ch.tensor(S, dtype=ch.float32).cuda()
+
+
+# Construct design matrix A
+def construct_design_matrix(m, n, sparsity):
+    """
+    Construct the design matrix using the sparse sign matrix.
+    """
+    S = sample_sparse_sign_matrix(m, n, sparsity)
+    A = np.sqrt(sparsity / n) * S
+    return A
+
+
 Section('training', 'Hyperparameters').params(
     lr=Param(float, 'The learning rate to use', default=5e-5),
     epochs=Param(int, 'Number of epochs to run for', default=20),
     batch_size=Param(int, 'Batch size', default=64),
     weight_decay=Param(float, 'L2 weight decay', default=0.01),
     num_workers=Param(int, 'The number of workers', default=4),
-    lr_tta=Param(bool, 'Test time augmentation by averaging with horizontally flipped version', default=True)
+    lr_tta=Param(bool, 'Test time augmentation by averaging with horizontally flipped version', default=True),
+    sparsity=Param(int, 'Sparsity level for compressed sensing', default=10)
 )
 
 Section('data', 'data related stuff').params(
@@ -37,11 +71,12 @@ Section('data', 'data related stuff').params(
         default='/tmp/datasets/cifar_ffcv/cifar_val.beton'),
 )
 
+
 @param('data.train_dataset')
 @param('data.val_dataset')
 @param('training.batch_size')
 @param('training.num_workers')
-def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_workers=None, mask=None):
+def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_workers=None):
     paths = {
         'train': train_dataset,
         'test': val_dataset
@@ -51,6 +86,14 @@ def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_
     CIFAR_STD = [51.5865, 50.847, 51.255]
     loaders = {}
 
+    # Generate sparse sign matrix for compressed sensing
+    total_samples = 50_000  # CIFAR-10 training dataset size
+    sparsity = 100     # Number of "influential" samples in total   
+    num_rows = int(np.ceil((sparsity * np.log(2 * total_samples / sparsity) + np.log(100)) / (0.465 ** 2)))
+
+    sparse_matrix = construct_design_matrix(num_rows, total_samples, sparsity)
+    mask = (sparse_matrix.sum(axis=1) > 0).to(dtype=ch.bool)   # Select rows with non-zero entries
+
     for name in ['train', 'test']:
         label_pipeline: List[Operation] = [IntDecoder(), ToTensor(), ToDevice(ch.device("cuda:0")), Squeeze()]
         image_pipeline: List[Operation] = [SimpleRGBImageDecoder()]
@@ -59,6 +102,11 @@ def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_
                 RandomHorizontalFlip(),
                 RandomTranslate(padding=2, fill=tuple(map(int, CIFAR_MEAN))),
                 Cutout(4, tuple(map(int, CIFAR_MEAN))),
+                ResizeWrapper((224, 224)),  # Use the custom wrapper for Resize
+            ])
+        else:
+            image_pipeline.extend([
+                ResizeWrapper((224, 224)),  # Resize for test data as well
             ])
         image_pipeline.extend([
             ToTensor(),
@@ -67,47 +115,36 @@ def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_
             Convert(ch.float16),
             torchvision.transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
         ])
-
+        
         ordering = OrderOption.RANDOM if name == 'train' else OrderOption.SEQUENTIAL
 
-        loaders[name] = Loader(paths[name], indices=(mask if name == 'train' else None),
+        loaders[name] = Loader(paths[name], indices=(np.nonzero(mask)[0] if name == 'train' else None),
                                batch_size=batch_size, num_workers=num_workers,
                                order=ordering, drop_last=(name == 'train'),
                                pipelines={'image': image_pipeline, 'label': label_pipeline})
 
     return loaders
 
-def construct_model(model_type="resnet"):
-    if model_type == "resnet":
-        num_class = 10
-        model = ch.nn.Sequential(
-            conv_bn(3, 64, kernel_size=3, stride=1, padding=1),
-            conv_bn(64, 128, kernel_size=5, stride=2, padding=2),
-            Residual(ch.nn.Sequential(conv_bn(128, 128), conv_bn(128, 128))),
-            conv_bn(128, 256, kernel_size=3, stride=1, padding=1),
-            ch.nn.MaxPool2d(2),
-            Residual(ch.nn.Sequential(conv_bn(256, 256), conv_bn(256, 256))),
-            conv_bn(256, 128, kernel_size=3, stride=1, padding=0),
-            ch.nn.AdaptiveMaxPool2d((1, 1)),
-            Flatten(),
-            ch.nn.Linear(128, num_class, bias=False),
-            Mul(0.2)
-        )
-        model = model.cuda().to(memory_format=ch.channels_last)
-        return model
-    elif model_type == "vit":
-        model = ViTForImageClassification.from_pretrained(
-            "google/vit-base-patch16-224-in21k", num_labels=10
-        ).cuda()
-        return model
-    elif model_type == "sparse_vit":
-        # Compressed sensing based ViT model with modifications (e.g., different pretrained weights)
-        model = ViTForImageClassification.from_pretrained(
-            "facebook/dino-vit-base", num_labels=10
-        ).cuda()
-        # Additional modifications, if needed
-        model.classifier.add_module("extra_layer", ch.nn.Linear(10, 10))
-        return model
+
+def construct_vit_model():
+    # Load pretrained ViT model
+    model = ViTForImageClassification.from_pretrained(
+        "google/vit-base-patch16-224-in21k",
+        num_labels=10  # CIFAR-10 has 10 classes
+    ).cuda()
+    
+    # Reinitialize the classifier head for CIFAR-10
+    model.classifier = ch.nn.Linear(
+        in_features=model.config.hidden_size,  # Match hidden size from pretrained config
+        out_features=10  # CIFAR-10 has 10 classes
+    ).cuda()
+    
+    # Ensure new classifier weights are initialized
+    ch.nn.init.xavier_uniform_(model.classifier.weight)
+    ch.nn.init.zeros_(model.classifier.bias)
+    
+    return model
+
 
 @param('training.lr')
 @param('training.epochs')
@@ -122,11 +159,12 @@ def train(model, loaders, lr=None, epochs=None, weight_decay=None):
         for ims, labs in tqdm(loaders['train']):
             opt.zero_grad()
             with autocast(device_type="cuda"):
-                out = model(ims)
+                out = model(ims).logits  # For ViT models
                 loss = loss_fn(out, labs)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
+
 
 @param('training.lr_tta')
 def evaluate(model, loaders, lr_tta=False):
@@ -135,9 +173,9 @@ def evaluate(model, loaders, lr_tta=False):
         all_margins = []
         for ims, labs in tqdm(loaders['test']):
             with autocast(device_type="cuda"):
-                out = model(ims)
+                out = model(ims).logits  # For ViT models
                 if lr_tta:
-                    out += model(ch.fliplr(ims))
+                    out += model(ch.fliplr(ims)).logits
                     out /= 2
                 class_logits = out[ch.arange(out.shape[0]), labs].clone()
                 out[ch.arange(out.shape[0]), labs] = -1000
@@ -148,161 +186,21 @@ def evaluate(model, loaders, lr_tta=False):
         print('Average margin:', all_margins.mean())
         return all_margins.numpy()
 
-# def main(index, logdir):
-#     config = get_current_config()
-#     parser = argparse.ArgumentParser(description='Fast CIFAR-10 training')
-#     parser.add_argument("--model", type=str, choices=['resnet', 'vit'], default='resnet', help="Model type: resnet or vit")
-#     config.augment_argparse(parser)
-#     config.collect_argparse_args(parser)
-#     config.validate(mode='stderr')
-#     config.summary()
 
-#     mask = (np.random.rand(50_000) > 0.5)
-#     loaders = make_dataloaders(mask=np.nonzero(mask)[0])
-#     model = construct_model(model_type=config.model)
-#     train(model, loaders)
-#     res = evaluate(model, loaders)
-#     print(mask.shape, res.shape)
-#     return {
-#         'masks': mask,
-#         'margins': res
-#     }
-# def main():
-#     config = get_current_config()
-#     parser = argparse.ArgumentParser(description='Fast CIFAR-10 training and comparison')
-#     parser.add_argument("--model", type=str, choices=['resnet', 'vit', 'both'], default='both',
-#                         help="Model type to train and evaluate: resnet, vit, or both")
-#     config.augment_argparse(parser)
-#     config.collect_argparse_args(parser)
-#     config.validate(mode='stderr')
-#     config.summary()
-
-#     # Randomly mask 50% of the training data for subset-based evaluation
-#     mask = (np.random.rand(50_000) > 0.5)
-#     loaders = make_dataloaders(mask=np.nonzero(mask)[0])
-
-#     results = {}
-
-#     # Train and evaluate ResNet
-#     if config.model in ['resnet', 'both']:
-#         print("\nTraining ResNet...")
-#         resnet_model = construct_model(model_type='resnet')
-#         train(resnet_model, loaders)
-#         resnet_margins = evaluate(resnet_model, loaders)
-#         results['resnet'] = {
-#             'margins': resnet_margins,
-#             'average_margin': resnet_margins.mean()
-#         }
-#         print(f"ResNet Average Margin: {results['resnet']['average_margin']}")
-
-#     # Train and evaluate ViT
-#     if config.model in ['vit', 'both']:
-#         print("\nTraining ViT...")
-#         vit_model = construct_model(model_type='vit')
-#         train(vit_model, loaders)
-#         vit_margins = evaluate(vit_model, loaders)
-#         results['vit'] = {
-#             'margins': vit_margins,
-#             'average_margin': vit_margins.mean()
-#         }
-#         print(f"ViT Average Margin: {results['vit']['average_margin']}")
-
-#     # Print comparison results
-#     if config.model == 'both':
-#         print("\nModel Comparison Results:")
-#         print(f"ResNet Average Margin: {results['resnet']['average_margin']}")
-#         print(f"ViT Average Margin: {results['vit']['average_margin']}")
-#         print("Margin Difference (ViT - ResNet):",
-#               results['vit']['average_margin'] - results['resnet']['average_margin'])
-
-#     # Save masks and margins
-#     print("\nSaving results...")
-#     np.savez(f"{config.logdir}/comparison_results.npz", masks=mask, resnet_margins=results.get('resnet', {}).get('margins'),
-#              vit_margins=results.get('vit', {}).get('margins'))
-#     print("Results saved successfully!")
-
-#     # Return results for further usage
-#     return {
-#         'masks': mask,
-#         'results': results
-#     }
-
-def main():
-    """
-    Main function to train and evaluate models.
-    """
+def main(index, logdir):
     config = get_current_config()
-    parser = argparse.ArgumentParser(description='Fast CIFAR-10 training and comparison')
-    parser.add_argument("--model", type=str, choices=['resnet', 'vit', 'sparse_vit', 'all'], default='all',
-                        help="Model type to train and evaluate: resnet, vit, sparse_vit, or all")
+    parser = ArgumentParser(description='Fast CIFAR-10 ViT training with compressed sensing')
     config.augment_argparse(parser)
     config.collect_argparse_args(parser)
     config.validate(mode='stderr')
     config.summary()
 
-    # Randomly mask 50% of the training data for subset-based evaluation
-    mask = (np.random.rand(50_000) > 0.5)
-    loaders = make_dataloaders(mask=np.nonzero(mask)[0])
-
-    results = {}
-
-    # Train and evaluate ResNet
-    if config.model in ['resnet', 'all']:
-        print("\nTraining ResNet...")
-        resnet_model = construct_model(model_type='resnet')
-        train(resnet_model, loaders)
-        resnet_margins = evaluate(resnet_model, loaders)
-        results['resnet'] = {
-            'margins': resnet_margins,
-            'average_margin': resnet_margins.mean()
-        }
-        print(f"ResNet Average Margin: {results['resnet']['average_margin']}")
-
-    # Train and evaluate ViT
-    if config.model in ['vit', 'all']:
-        print("\nTraining ViT...")
-        vit_model = construct_model(model_type='vit')
-        train(vit_model, loaders)
-        vit_margins = evaluate(vit_model, loaders)
-        results['vit'] = {
-            'margins': vit_margins,
-            'average_margin': vit_margins.mean()
-        }
-        print(f"ViT Average Margin: {results['vit']['average_margin']}")
-
-    # Train and evaluate Compressed sensing based ViT
-    if config.model in ['sparse_vit', 'all']:
-        print("\nTraining Compressed sensing based ViT...")
-        sparse_vit_model = construct_model(model_type='sparse_vit')
-        train(sparse_vit_model, loaders)
-        sparse_vit_margins = evaluate(sparse_vit_model, loaders)
-        results['sparse_vit'] = {
-            'margins': sparse_vit_margins,
-            'average_margin': sparse_vit_margins.mean()
-        }
-        print(f"Compressed sensing based ViT Average Margin: {results['sparse_vit']['average_margin']}")
-
-    # Print comparison results
-    if config.model == 'all':
-        print("\nModel Comparison Results:")
-        print(f"ResNet Average Margin: {results['resnet']['average_margin']}")
-        print(f"ViT Average Margin: {results['vit']['average_margin']}")
-        print(f"Compressed sensing based ViT Average Margin: {results['sparse_vit']['average_margin']}")
-        print("Margin Differences:")
-        print(f"  ViT - ResNet: {results['vit']['average_margin'] - results['resnet']['average_margin']}")
-        print(f"  Compressed sensing based ViT - ResNet: {results['sparse_vit']['average_margin'] - results['resnet']['average_margin']}")
-        print(f"  Compressed sensing based ViT - ViT: {results['sparse_vit']['average_margin'] - results['vit']['average_margin']}")
-
-    # Save masks and margins
-    print("\nSaving results...")
-    np.savez(f"{config.logdir}/comparison_results.npz", masks=mask,
-             resnet_margins=results.get('resnet', {}).get('margins'),
-             vit_margins=results.get('vit', {}).get('margins'),
-             sparse_vit_margins=results.get('sparse_vit', {}).get('margins'))
-    print("Results saved successfully!")
-
-    # Return results for further usage
+    loaders = make_dataloaders()
+    model = construct_vit_model()
+    train(model, loaders)
+    res = evaluate(model, loaders)
+    print(mask.shape, res.shape)
     return {
         'masks': mask,
-        'results': results
+        'margins': res
     }
