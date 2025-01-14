@@ -344,14 +344,12 @@ def main():
     # print("Recovered x with shape:", x_hat.shape)
 
     # 6) Save results
-    np.savez(f"{config.logdir}/cs_results.npz",
-             A=A, S=S, y=y
-             # x_hat=x_hat if you reconstruct
-             )
-    print("Compressed-sensing run complete!")
+    # np.savez(f"{config.logdir}/cs_results.npz",
+    #          A=A, S=S, y=y
+    #          # x_hat=x_hat if you reconstruct
+    #          )
+    print("Compressed-sensing approach run complete!")
     return {
-        'A': A,
-        'S': S,
-        'y': y
-    }
+        'masks': A,
+        'margins': y
     }
