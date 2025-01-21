@@ -378,7 +378,7 @@ def main(index, logdir):
 
     # We'll sample a matrix S ∈ {+1, 0, -1}^{m×n}
     n = 50000   # e.g. total CIFAR-10 train size
-    s = 100     
+    s = 3     
     m = 100     
 
 
