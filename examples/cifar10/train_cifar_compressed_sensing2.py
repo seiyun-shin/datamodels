@@ -377,10 +377,10 @@ def main(index, logdir):
     epochs = config['training.epochs']
 
     # We'll sample a matrix S ∈ {+1, 0, -1}^{m×n}
-    n = 50000
-    s = 100
-    m = 20  # for demonstration, let's use a smaller m to save time
-    sparsity = n/s
+    n = 50000   # e.g. total CIFAR-10 train size
+    s = 100     
+    m = 100     
+
 
     # (1) Sample S
     S = sample_sparse_sign_matrix(m=m, n=n, sparsity=sparsity)
