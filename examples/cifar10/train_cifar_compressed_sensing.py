@@ -258,7 +258,7 @@ def train_two_models_for_row(row_idx,
     yi = np.sqrt(s / n) * diff_val
     return yi
 
-def main():
+def main(index, logdir):
     """
     Example main() in train_cifar.py that integrates the
     "tentative procedure" from your attached docs.
