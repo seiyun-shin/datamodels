@@ -1,7 +1,6 @@
-from argparse import ArgumentParser
-from typing import List
 import time
 import numpy as np
+from typing import List
 from tqdm import tqdm
 
 import torch as ch
@@ -10,16 +9,21 @@ from torch.nn import CrossEntropyLoss
 from torch.optim import SGD, lr_scheduler
 import torchvision
 import argparse
+from argparse import ArgumentParser
+
 from fastargs import get_current_config, Param, Section
 from fastargs.decorators import param
 
 from ffcv.fields.decoders import IntDecoder, SimpleRGBImageDecoder
 from ffcv.loader import Loader, OrderOption
 from ffcv.pipeline.operation import Operation
-from ffcv.transforms import RandomHorizontalFlip, Cutout, \
-    RandomTranslate, Convert, ToDevice, ToTensor, ToTorchImage
+from ffcv.transforms import (RandomHorizontalFlip, Cutout, RandomTranslate,
+                             Convert, ToDevice, ToTensor, ToTorchImage)
 from ffcv.transforms.common import Squeeze
 
+# ---------------------------
+# Fastargs sections & params
+# ---------------------------
 Section('training', 'Hyperparameters').params(
     lr=Param(float, 'The learning rate to use', default=0.5),
     epochs=Param(int, 'Number of epochs to run for', default=24),
@@ -38,6 +42,10 @@ Section('data', 'data related stuff').params(
     val_dataset=Param(str, '.dat file to use for validation', 
         default='/tmp/datasets/cifar_ffcv/cifar_val.beton'),
 )
+
+# ---------------------------
+# Utility functions
+# ---------------------------
 def sample_sparse_sign_matrix(m, n, sparsity):
     """
     Sample an m x n sparse sign matrix S where each entry is in {+1, 0, -1},
@@ -46,7 +54,6 @@ def sample_sparse_sign_matrix(m, n, sparsity):
          0 with prob 1 - 1/sparsity
         -1 with prob 1/(2*sparsity)
     """
-    # Example: p=[1/(2*sparsity), 1 - 1/sparsity, 1/(2*sparsity)]
     S = np.random.choice([1, 0, -1],
                          size=(m, n),
                          p=[1/(2*sparsity), 1 - 1/sparsity, 1/(2*sparsity)])
@@ -55,7 +62,7 @@ def sample_sparse_sign_matrix(m, n, sparsity):
 def get_indices_from_row(row):
     """
     Given a 1D numpy array 'row' in {+1,0,-1},
-    return sets (or lists) of indices for P (where row=+1),
+    return arrays of indices for P (where row=+1),
     N (where row=-1), and Z (where row=0).
     """
     P = np.where(row == 1)[0]
@@ -67,20 +74,23 @@ def get_indices_from_row(row):
 @param('data.val_dataset')
 @param('training.batch_size')
 @param('training.num_workers')
-def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_workers=None, mask=None):
+def make_dataloaders(train_dataset=None, val_dataset=None,
+                     batch_size=None, num_workers=None, mask=None):
     paths = {
         'train': train_dataset,
-        'test': val_dataset
+        'test':  val_dataset
     }
 
-    start_time = time.time()
     CIFAR_MEAN = [125.307, 122.961, 113.8575]
-    CIFAR_STD = [51.5865, 50.847, 51.255]
+    CIFAR_STD  = [51.5865, 50.847,  51.255]
     loaders = {}
 
     for name in ['train', 'test']:
-        label_pipeline: List[Operation] = [IntDecoder(), ToTensor(), ToDevice(ch.device("cuda:0")), Squeeze()]
+        label_pipeline: List[Operation] = [
+            IntDecoder(), ToTensor(), ToDevice(ch.device("cuda:0")), Squeeze()
+        ]
         image_pipeline: List[Operation] = [SimpleRGBImageDecoder()]
+
         if name == 'train':
             image_pipeline.extend([
                 RandomHorizontalFlip(),
@@ -97,41 +107,56 @@ def make_dataloaders(train_dataset=None, val_dataset=None, batch_size=None, num_
         
         ordering = OrderOption.RANDOM if name == 'train' else OrderOption.SEQUENTIAL
 
-        loaders[name] = Loader(paths[name], indices=(mask if name == 'train' else None),
-                               batch_size=batch_size, num_workers=num_workers,
-                               order=ordering, drop_last=(name == 'train'),
-                               pipelines={'image': image_pipeline, 'label': label_pipeline})
+        # If 'mask' is supplied (a list/array of indices), apply it only to 'train'
+        loaders[name] = Loader(paths[name],
+                               indices=(mask if name == 'train' else None),
+                               batch_size=batch_size,
+                               num_workers=num_workers,
+                               order=ordering,
+                               drop_last=(name == 'train'),
+                               pipelines={'image': image_pipeline, 'label': label_pipeline}
+                              )
 
     return loaders
 
-# Model (from KakaoBrain: https://github.com/wbaek/torchskeleton)
+# Simple model components
 class Mul(ch.nn.Module):
     def __init__(self, weight):
        super(Mul, self).__init__()
        self.weight = weight
-    def forward(self, x): return x * self.weight
+    def forward(self, x):
+        return x * self.weight
 
 class Flatten(ch.nn.Module):
-    def forward(self, x): return x.view(x.size(0), -1)
+    def forward(self, x):
+        return x.view(x.size(0), -1)
 
 class Residual(ch.nn.Module):
     def __init__(self, module):
         super(Residual, self).__init__()
         self.module = module
-    def forward(self, x): return x + self.module(x)
+    def forward(self, x):
+        return x + self.module(x)
 
 def conv_bn(channels_in, channels_out, kernel_size=3, stride=1, padding=1, groups=1):
     return ch.nn.Sequential(
-            ch.nn.Conv2d(channels_in, channels_out, kernel_size=kernel_size,
-                         stride=stride, padding=padding, groups=groups, bias=False),
-            ch.nn.BatchNorm2d(channels_out),
-            ch.nn.ReLU(inplace=True)
+        ch.nn.Conv2d(channels_in, channels_out, kernel_size=kernel_size,
+                     stride=stride, padding=padding, groups=groups, bias=False),
+        ch.nn.BatchNorm2d(channels_out),
+        ch.nn.ReLU(inplace=True)
     )
 
-def construct_model():
+# FIX #1: let construct_model optionally accept a string for model_type
+def construct_model(model_type="resnet"):
+    """
+    Extend this if you really need different architectures (resnet/vit/etc.).
+    For now, all calls just build the same example CNN.
+    """
+    # If you want to branch on model_type, do so here
     num_class = 10
+
     model = ch.nn.Sequential(
-        conv_bn(3, 64, kernel_size=3, stride=1, padding=1),
+        conv_bn(3,   64, kernel_size=3, stride=1, padding=1),
         conv_bn(64, 128, kernel_size=5, stride=2, padding=2),
         Residual(ch.nn.Sequential(conv_bn(128, 128), conv_bn(128, 128))),
         conv_bn(128, 256, kernel_size=3, stride=1, padding=1),
@@ -206,28 +231,24 @@ def train_two_models_for_row(row_idx,
     """
     row_idx: which row we are dealing with (for logging/debug)
     row_vals: 1D numpy array in {+1,0,-1}, length n
-    loaders: dictionary of {'train': some_loader, 'test': some_loader}
-    model_constructor: function that constructs a fresh model (e.g. ResNet or ViT)
+    loaders: dictionary of {'train':some_loader,'test':some_loader}
+    model_constructor: function that constructs a fresh model
     s, n: used in the sqrt(s/n) factor
     """
-
     # 1) figure out P_i, N_i, Z_i
     P, N, Z = get_indices_from_row(row_vals)
-    
-    # 2) Build subsets for training:
-    #    We might create specialized ffcv/Loaders, or just filter on-the-fly.
-    #    For simplicity, let's define quick "subloaders" that only yield
-    #    data from the desired subset of indices.
-    #    If your code already uses mask=..., that’s one approach. Or you can
-    #    adapt your existing make_dataloaders to accept custom subsets.
-    #    Pseudocode:
+
+    # FIX #2: replace .union(...) with np.concatenate or np.union1d
+    # e.g. mask = np.concatenate([P, Z]) or union1d(P, Z).
+    pz_mask = np.union1d(P, Z)  # or np.concatenate([P, Z])
+    nz_mask = np.union1d(N, Z)
 
     loaders_pz = make_dataloaders(
         train_dataset=get_current_config()['data.train_dataset'],
         val_dataset=get_current_config()['data.val_dataset'],
         batch_size=get_current_config()['training.batch_size'],
         num_workers=get_current_config()['training.num_workers'],
-        mask=P.union(Z)  # or np.concatenate([P, Z])
+        mask=pz_mask
     )
 
     loaders_nz = make_dataloaders(
@@ -235,7 +256,7 @@ def train_two_models_for_row(row_idx,
         val_dataset=get_current_config()['data.val_dataset'],
         batch_size=get_current_config()['training.batch_size'],
         num_workers=get_current_config()['training.num_workers'],
-        mask=N.union(Z)  # or np.concatenate([N, Z])
+        mask=nz_mask
     )
 
     # 3) Train two separate models
@@ -245,13 +266,10 @@ def train_two_models_for_row(row_idx,
     model_nz = model_constructor().to(device)
     train(model_nz, loaders_nz)
 
-    # 4) Evaluate on test set (or x_test),
-    #    get difference in predictions for y_i
-    out_pz = evaluate(model_pz, loaders)   # shape (#test_examples,)
-    out_nz = evaluate(model_nz, loaders)   # shape (#test_examples,)
+    # 4) Evaluate on test set
+    out_pz = evaluate(model_pz, loaders)  # shape (#test_examples,)
+    out_nz = evaluate(model_nz, loaders)  # shape (#test_examples,)
 
-    # for simplicity, let's take the difference in average margins
-    # or you might store the entire vector difference if you prefer
     diff_val = (out_pz.mean() - out_nz.mean())
 
     # 5) scale by sqrt(s/n)
@@ -260,8 +278,8 @@ def train_two_models_for_row(row_idx,
 
 def main(index, logdir):
     """
-    Example main() in train_cifar.py that integrates the
-    "tentative procedure" from your attached docs.
+    Example main() in train_cifar_compressed_sensing.py.
+    Accepts 'index' and 'logdir' so it matches your worker's call signature.
     """
     config = get_current_config()
     parser = argparse.ArgumentParser(description='Fast CIFAR-10 training + Compressed Sensing')
@@ -269,7 +287,6 @@ def main(index, logdir):
                         choices=['resnet', 'vit', 'sparse_vit', 'all'],
                         default='all',
                         help="Which model(s) to train and evaluate.")
-    # Possibly add more args for 'm', 'sparsity', etc.
     config.augment_argparse(parser)
     config.collect_argparse_args(parser)
     config.validate(mode='stderr')
@@ -277,78 +294,59 @@ def main(index, logdir):
 
     # Basic hyperparams
     device = 'cuda'
-    lr = config['training.lr']
+    lr     = config['training.lr']
     epochs = config['training.epochs']
     # etc.
 
     # Number of training examples
     n = 50000   # e.g. total CIFAR-10 train size
-    # Suppose we fix s=100
-    s = 100
-    # Suppose we set m=200 as #rows in S (just an example)
-    m = 200
-    # "sparsity" param from your formula ~ 1/(2*sparsity) chance for +1, etc.
-    #  or set it so that expected #nonzeros in row is s...
-    #  e.g. expected #nonzeros = n * 1/sparsity
-    #  so if we want ~ s=100 nonzeros, we can do 'sparsity = n/s'
+    s = 100     # Suppose we fix s=100
+    m = 200     # number of measurements
+
+    # If we want ~100 nonzeros on average, then sparsity = n/s
     sparsity = n / s
 
     # 1) Sample S in {+1,0,-1}, shape (m,n)
     S = sample_sparse_sign_matrix(m=m, n=n, sparsity=sparsity)
-
-    # 2) We'll define A = sqrt(s/n)*S
+    # 2) A = sqrt(s/n)*S
     A = np.sqrt(float(s)/n) * S
 
-    # 3) Make your usual data loaders for the full dataset:
+    # 3) Make data loaders for full dataset
     loaders = make_dataloaders()
-
-    # 4) For each row i in [0..m-1], define Pi, Ni, Zi, train two models, measure y_i
-    #    We'll store them in a measurement vector y of length m
-    y = np.zeros(m, dtype=np.float32)
 
     # Decide a model constructor function based on config
     def model_constructor():
-        if config['model'] == 'resnet':
+        which = config['model']
+        if which == 'resnet':
             return construct_model("resnet")
-        elif config['model'] == 'vit':
+        elif which == 'vit':
             return construct_model("vit")
-        elif config['model'] == 'sparse_vit':
+        elif which == 'sparse_vit':
             return construct_model("sparse_vit")
         else:
-            # default or your choice
+            # default
             return construct_model("resnet")
 
+    # 4) For each row i, train two models & measure y_i
+    y = np.zeros(m, dtype=np.float32)
     for i in range(m):
-        row_vals = S[i]     # shape (n,)
-        # Train two models, get y_i
+        row_vals = S[i]  # shape (n,)
         y_i = train_two_models_for_row(
             row_idx=i,
             row_vals=row_vals,
             loaders=loaders,
             model_constructor=model_constructor,
             device=device,
-            s=s, n=n
+            s=s, 
+            n=n
         )
         y[i] = y_i
         print(f"Row {i}/{m}: measurement y_i = {y_i}")
 
     print("Collected measurement vector y of shape:", y.shape)
-
-    # 5) (Optional) Reconstruct x from y = A x:
-    #    e.g. x_hat = l1_minimize(A, y). Then x_hat is your approximate solution
-    #    This is exactly the typical "compressed sensing" step:
-    #       min_x || x ||_1  s.t.  || A x - y || <= eta
-    #    For a quick test:
-    # from fast_l1.solver import l1_minimize
-    # x_hat = l1_minimize(A, y, lam=0.1, max_iter=1000)
-    # print("Recovered x with shape:", x_hat.shape)
-
-    # 6) Save results
-    # np.savez(f"{config.logdir}/cs_results.npz",
-    #          A=A, S=S, y=y
-    #          # x_hat=x_hat if you reconstruct
-    #          )
     print("Compressed-sensing approach run complete!")
+
+    # Example of returning data for logging
     return {
         'masks': A,
         'margins': y
