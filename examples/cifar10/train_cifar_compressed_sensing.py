@@ -36,11 +36,16 @@ Section('training', 'Hyperparameters').params(
     lr_tta=Param(bool, 'Test time augmentation by averaging with horizontally flipped version', default=True)
 )
 
-Section('data', 'data related stuff').params(
+Section('data', 'Data-related stuff').params(
     train_dataset=Param(str, '.dat file to use for training', 
         default='/tmp/datasets/cifar_ffcv/cifar_train.beton'),
     val_dataset=Param(str, '.dat file to use for validation', 
         default='/tmp/datasets/cifar_ffcv/cifar_val.beton'),
+)
+
+# NEW: add a section for the model choice
+Section('model', 'Model choice').params(
+    arch=Param(str, 'Which model(s) to train/evaluate', default='resnet')
 )
 
 # ---------------------------
@@ -51,7 +56,7 @@ def sample_sparse_sign_matrix(m, n, sparsity):
     Sample an m x n sparse sign matrix S where each entry is in {+1, 0, -1},
     using probabilities:
         +1 with prob 1/(2*sparsity)
-         0 with prob 1 - 1/sparsity
+        0 with prob 1 - 1/sparsity
         -1 with prob 1/(2*sparsity)
     """
     S = np.random.choice([1, 0, -1],
@@ -107,15 +112,15 @@ def make_dataloaders(train_dataset=None, val_dataset=None,
         
         ordering = OrderOption.RANDOM if name == 'train' else OrderOption.SEQUENTIAL
 
-        # If 'mask' is supplied (a list/array of indices), apply it only to 'train'
-        loaders[name] = Loader(paths[name],
-                               indices=(mask if name == 'train' else None),
-                               batch_size=batch_size,
-                               num_workers=num_workers,
-                               order=ordering,
-                               drop_last=(name == 'train'),
-                               pipelines={'image': image_pipeline, 'label': label_pipeline}
-                              )
+        loaders[name] = Loader(
+            paths[name],
+            indices=(mask if name == 'train' else None),
+            batch_size=batch_size,
+            num_workers=num_workers,
+            order=ordering,
+            drop_last=(name == 'train'),
+            pipelines={'image': image_pipeline, 'label': label_pipeline}
+        )
 
     return loaders
 
@@ -146,13 +151,11 @@ def conv_bn(channels_in, channels_out, kernel_size=3, stride=1, padding=1, group
         ch.nn.ReLU(inplace=True)
     )
 
-# FIX #1: let construct_model optionally accept a string for model_type
 def construct_model(model_type="resnet"):
     """
     Extend this if you really need different architectures (resnet/vit/etc.).
     For now, all calls just build the same example CNN.
     """
-    # If you want to branch on model_type, do so here
     num_class = 10
 
     model = ch.nn.Sequential(
@@ -182,9 +185,11 @@ def train(model, loaders, lr=None, epochs=None, label_smoothing=None,
     opt = SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
     iters_per_epoch = len(loaders['train'])
     # Cyclic LR with single triangle
-    lr_schedule = np.interp(np.arange((epochs+1) * iters_per_epoch),
-                            [0, lr_peak_epoch * iters_per_epoch, epochs * iters_per_epoch],
-                            [0, 1, 0])
+    lr_schedule = np.interp(
+        np.arange((epochs+1) * iters_per_epoch),
+        [0, lr_peak_epoch * iters_per_epoch, epochs * iters_per_epoch],
+        [0, 1, 0]
+    )
     scheduler = lr_scheduler.LambdaLR(opt, lr_schedule.__getitem__)
     scaler = GradScaler("cuda")
     loss_fn = CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -238,9 +243,8 @@ def train_two_models_for_row(row_idx,
     # 1) figure out P_i, N_i, Z_i
     P, N, Z = get_indices_from_row(row_vals)
 
-    # FIX #2: replace .union(...) with np.concatenate or np.union1d
-    # e.g. mask = np.concatenate([P, Z]) or union1d(P, Z).
-    pz_mask = np.union1d(P, Z)  # or np.concatenate([P, Z])
+    # combine arrays using union1d or concatenate
+    pz_mask = np.union1d(P, Z)  
     nz_mask = np.union1d(N, Z)
 
     loaders_pz = make_dataloaders(
@@ -283,25 +287,26 @@ def main(index, logdir):
     """
     config = get_current_config()
     parser = argparse.ArgumentParser(description='Fast CIFAR-10 training + Compressed Sensing')
-    parser.add_argument("--model", type=str,
-                        choices=['resnet', 'vit', 'sparse_vit', 'all'],
-                        default='all',
-                        help="Which model(s) to train and evaluate.")
+    
+    # We'll still accept --model on the CLI, but it now maps to the fastargs param "model.arch"
+    parser.add_argument("--model.arch", type=str,
+        choices=['resnet', 'vit', 'sparse_vit', 'all'],
+        default='resnet',
+        help="Which model(s) to train and evaluate.")
+
     config.augment_argparse(parser)
     config.collect_argparse_args(parser)
     config.validate(mode='stderr')
     config.summary()
 
-    # Basic hyperparams
     device = 'cuda'
     lr     = config['training.lr']
     epochs = config['training.epochs']
-    # etc.
 
     # Number of training examples
     n = 50000   # e.g. total CIFAR-10 train size
-    s = 100     # Suppose we fix s=100
-    m = 200     # number of measurements
+    s = 100     
+    m = 200     
 
     # If we want ~100 nonzeros on average, then sparsity = n/s
     sparsity = n / s
@@ -314,17 +319,19 @@ def main(index, logdir):
     # 3) Make data loaders for full dataset
     loaders = make_dataloaders()
 
-    # Decide a model constructor function based on config
+    # NEW: read the 'model.arch' param from config
     def model_constructor():
-        which = config['model']
+        which = config['model.arch']
         if which == 'resnet':
             return construct_model("resnet")
         elif which == 'vit':
             return construct_model("vit")
         elif which == 'sparse_vit':
             return construct_model("sparse_vit")
+        elif which == 'all':
+            # default to resnet, or any custom logic
+            return construct_model("resnet")
         else:
-            # default
             return construct_model("resnet")
 
     # 4) For each row i, train two models & measure y_i
@@ -346,7 +353,6 @@ def main(index, logdir):
     print("Collected measurement vector y of shape:", y.shape)
     print("Compressed-sensing approach run complete!")
 
-    # Example of returning data for logging
     return {
         'masks': A,
         'margins': y
