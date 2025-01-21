@@ -305,7 +305,7 @@ def main(index, logdir):
 
     # Number of training examples
     n = 50000   # e.g. total CIFAR-10 train size
-    s = 100     
+    s = 50000/3     
     m = 100     
 
     # If we want ~100 nonzeros on average, then sparsity = n/s
