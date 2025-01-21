@@ -306,10 +306,11 @@ def main(index, logdir):
     # Number of training examples
     n = 50000   # e.g. total CIFAR-10 train size
     s = 100     
-    m = 200     
+    m = 100     
 
     # If we want ~100 nonzeros on average, then sparsity = n/s
-    sparsity = n / s
+    # sparsity = n / s
+    sparsity = 3
 
     # 1) Sample S in {+1,0,-1}, shape (m,n)
     S = sample_sparse_sign_matrix(m=m, n=n, sparsity=sparsity)
