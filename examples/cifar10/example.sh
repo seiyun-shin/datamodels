@@ -23,11 +23,10 @@ python -m datamodels.training.initialize_store \
  #    --worker.main_import=examples.cifar10.train_cifar  \
  #    --worker.logdir=${tmp_dir}
 for idx in {0..3}; do
-  python -m datamodels.training.worker \
-     --worker.index=${idx} \
-     --worker.main_import=examples.cifar10.train_cifar_compressed_sensing \
-     --worker.logdir=${tmp_dir} \
-     --model.arch=resnet
+ python -m datamodels.training.worker \
+    --worker.index=${idx} \
+    --worker.main_import=examples.cifar10.train_cifar_compressed_sensing  \
+    --worker.logdir=${tmp_dir}
 done
 
 echo "\n\n"
