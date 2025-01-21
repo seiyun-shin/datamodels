@@ -231,7 +231,7 @@ def train_two_models_for_row(row_idx,
                              loaders,
                              model_constructor,
                              device='cuda',
-                             s=100,
+                             s=50000/3,
                              n=50000):
     """
     row_idx: which row we are dealing with (for logging/debug)
