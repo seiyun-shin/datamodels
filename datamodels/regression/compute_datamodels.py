@@ -16,6 +16,61 @@ from ffcv.pipeline.operation import Operation
 from fast_l1 import regressor
 from dataclasses import replace
 
+########################
+# SRG & Spearman
+########################
+from scipy.stats import spearmanr
+
+def srg_score(w, ground_truth_set, full_set=None):
+    if full_set is None:
+        full_set = np.arange(len(w))
+    sum_in_G = w[ground_truth_set].sum()
+    sum_in_Omega = w[full_set].sum()
+    frac_G = len(ground_truth_set)/float(len(full_set))
+    if sum_in_Omega == 0 or frac_G == 0:
+        return 0.0
+    ratio_attrib = (sum_in_G / sum_in_Omega) / frac_G
+    srg = 1.0 - ratio_attrib
+    return max(0.0, min(srg, 1.0))
+
+def spearman_rank_corr(w, w_ref):
+    rho, pval = spearmanr(w, w_ref)
+    return rho, pval
+
+########################
+# Example: incremental removal
+########################
+def retrain_mse(X, y):
+    """
+    Retrain on (X, y) and return MSE.
+    For data-level weighting, this is just a placeholder:
+    If w_final is per-feature, you'd remove features from X. 
+    If w_final is per-data, you'd remove rows from X,y.
+    """
+    if len(X) == 0:
+        return np.nan
+    # naive pseudo-inverse
+    w = np.linalg.pinv(X).dot(y)
+    mse = np.mean((y - X.dot(w))**2)
+    return mse
+
+def incremental_removal_analysis(X, y, w_final):
+    """
+    Sort data or features by w_final (descending).
+    Remove top k, measure MSE each time.
+    """
+    n = len(y)
+    sorted_idx = np.argsort(-w_final)  # largest to smallest
+    mses = []
+    for k in range(n+1):
+        removed = sorted_idx[:k]
+        mask = np.ones(n, dtype=bool)
+        mask[removed] = False
+        X_sub = X[mask]
+        y_sub = y[mask]
+        mse_k = retrain_mse(X_sub, y_sub)
+        mses.append(mse_k)
+    return mses
 
 class Slice(Operation):
     def __init__(self, start_ind, end_ind) -> None:
